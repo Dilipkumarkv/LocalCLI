@@ -1,0 +1,6 @@
+{
+  "name": "gx Termux CLI",
+  "description": "Python CLI client for local llama.cpp llama-server on Termux Android",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
