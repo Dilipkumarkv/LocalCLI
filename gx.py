@@ -43,6 +43,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "models_dir": "~/models",
     "host": "127.0.0.1",
     "port": 8080,
+    # Enable the agent 'shell' tool (NOT sandbox-confined; asks confirmation unless --yes).
+    "agent_shell": True,
 }
 
 BUILTIN_PERSONAS: Dict[str, Dict[str, Any]] = {
@@ -384,6 +386,13 @@ def save_config(cfg: Dict[str, Any]) -> None:
         json.dump(cfg, f, indent=2)
 
 
+def parse_bool_config(value: Any) -> bool:
+    """Coerce a config value (bool or string) into a boolean flag."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_base_url(
     config: Dict[str, Any],
     cli_host: Optional[str] = None,
@@ -546,9 +555,15 @@ def read_piped_stdin() -> str:
 # SSE Parsing & Networking
 
 
-def parse_sse_chunks(raw_bytes: bytes, buffer: str) -> Tuple[List[str], str, bool]:
+def parse_sse_chunks(
+    raw_bytes: bytes,
+    buffer: str,
+    timings_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[List[str], str, bool]:
     """Parse raw stream bytes for OpenAI/llama.cpp SSE data lines.
 
+    If timings_sink is provided, llama.cpp "timings" objects are passed to it
+    as they appear in the stream.
     Returns (list_of_tokens, remaining_buffer, is_done).
     """
     buffer += raw_bytes.decode("utf-8", errors="replace")
@@ -571,6 +586,8 @@ def parse_sse_chunks(raw_bytes: bytes, buffer: str) -> Tuple[List[str], str, boo
                 break
             try:
                 data = json.loads(data_str)
+                if timings_sink is not None and "timings" in data:
+                    timings_sink(data["timings"])
                 choices = data.get("choices", [])
                 if choices:
                     first = choices[0]
@@ -616,7 +633,7 @@ def stream_chat_completion_detailed(
     t_start = time.perf_counter()
     t_first_token: Optional[float] = None
     buffer = ""
-    server_timings: Optional[Dict[str, Any]] = None
+    captured_timings: List[Dict[str, Any]] = []
 
     try:
         with urllib.request.urlopen(req, timeout=120) as response:
@@ -624,37 +641,18 @@ def stream_chat_completion_detailed(
                 chunk = response.read(64)
                 if not chunk:
                     break
-                buffer += chunk.decode("utf-8", errors="replace")
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line or line.startswith(":"):
-                        continue
-                    if line.startswith("data:"):
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            buffer = ""
-                            break
-                        try:
-                            data = json.loads(data_str)
-                            if "timings" in data:
-                                server_timings = data["timings"]
-                            choices = data.get("choices", [])
-                            if choices:
-                                first = choices[0]
-                                delta = first.get("delta", {})
-                                token = delta.get("content", "")
-                                if not token and "text" in first:
-                                    token = first["text"]
-                                if token:
-                                    if t_first_token is None:
-                                        t_first_token = time.perf_counter()
-                                    full_text.append(token)
-                                    token_count += 1
-                                    if on_token:
-                                        on_token(token)
-                        except json.JSONDecodeError:
-                            continue
+                tokens, buffer, is_done = parse_sse_chunks(
+                    chunk, buffer, timings_sink=captured_timings.append
+                )
+                for token in tokens:
+                    if t_first_token is None:
+                        t_first_token = time.perf_counter()
+                    full_text.append(token)
+                    token_count += 1
+                    if on_token:
+                        on_token(token)
+                if is_done:
+                    break
     except urllib.error.URLError as e:
         if isinstance(e.reason, ConnectionRefusedError) or "Connection refused" in str(e):
             raise ConnectionError(
@@ -668,6 +666,7 @@ def stream_chat_completion_detailed(
             ) from e
         raise
 
+    server_timings: Optional[Dict[str, Any]] = captured_timings[-1] if captured_timings else None
     t_end = time.perf_counter()
     elapsed = max(t_end - t_start, 0.001)
     ttft_sec = (t_first_token - t_start) if t_first_token is not None else elapsed
@@ -1368,19 +1367,23 @@ def cmd_bench(args: argparse.Namespace) -> int:
         results = []
         orig_threads = config.get("threads", 4)
 
-        for th in thread_list:
-            config["threads"] = th
+        try:
+            for th in thread_list:
+                config["threads"] = th
+                save_config(config)
+                print(f"\nRestarting server with threads={th}...")
+                cmd_server(argparse.Namespace(server_action="stop"))
+                if cmd_server(argparse.Namespace(server_action="start")) != 0:
+                    sys.stderr.write(f"Error: Failed to start server with threads={th}. Sweep aborted.\n")
+                    break
+                res = run_benchmark_suite(runs, prompt_tokens, gen_tokens, base_url, config)
+                res["threads"] = th
+                results.append(res)
+        except ConnectionError as e:
+            sys.stderr.write(f"Error: benchmark failed during sweep: {e}\nSweep aborted.\n")
+        finally:
+            config["threads"] = orig_threads
             save_config(config)
-            print(f"\nRestarting server with threads={th}...")
-            cmd_server(argparse.Namespace(server_action="stop"))
-            cmd_server(argparse.Namespace(server_action="start"))
-            time.sleep(1.0)
-            res = run_benchmark_suite(runs, prompt_tokens, gen_tokens, base_url, config)
-            res["threads"] = th
-            results.append(res)
-
-        config["threads"] = orig_threads
-        save_config(config)
 
         best_speed = max(r["avg_gen_tok_s"] for r in results) if results else 0.0
 
@@ -1469,11 +1472,24 @@ Available Tools:
    Example: {"tool": "search_files", "args": {"pattern": "TODO", "path": "."}}
 5. calc(expression) - Safely evaluate a math expression (no eval/attributes).
    Example: {"tool": "calc", "args": {"expression": "(12 + 34) * 5"}}
-6. shell(cmd) - Run a shell command in sandbox (20s timeout, max 2000 chars output).
+
+Always reply with ONLY a single JSON object.
+"""
+
+# The shell tool runs on the host with only the cwd set to the sandbox root; it is
+# NOT filesystem-confined like the tools above. It can be disabled via config.
+_SHELL_TOOL_PROMPT = """6. shell(cmd) - Run a shell command on the host with the sandbox as working
+   directory (20s timeout, max 2000 chars output). Shell commands are NOT confined to
+   the sandbox; prefer the file tools for sandbox work.
    Example: {"tool": "shell", "args": {"cmd": "ls -la"}}
 
 Always reply with ONLY a single JSON object.
 """
+
+AGENT_SYSTEM_PROMPT_WITH_SHELL = AGENT_SYSTEM_PROMPT.replace(
+    "\nAlways reply with ONLY a single JSON object.\n",
+    "\n" + _SHELL_TOOL_PROMPT,
+)
 
 
 def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -1755,7 +1771,12 @@ def tool_shell(
     yes: bool = False,
     confirm_fn: Optional[Callable[[str], bool]] = None,
 ) -> str:
-    """Run a shell command inside the sandbox root directory (20s timeout, max 2000 chars output)."""
+    """Run a shell command with the sandbox root as working directory (20s timeout, max 2000 chars output).
+
+    NOTE: unlike the dedicated file tools, shell commands are NOT confined to the
+    sandbox - the model can reach the whole device. Requires interactive confirmation
+    unless --yes is passed, and can be disabled entirely via 'gx set agent_shell false'.
+    """
     sandbox_root = os.path.realpath(os.path.abspath(sandbox_dir))
     prompt = f"Run: {cmd}? [y/N]: "
 
@@ -1819,7 +1840,9 @@ def cmd_agent(args: argparse.Namespace) -> int:
     task = args.task
     save_session_name = getattr(args, "save", None)
 
-    system_content = (persona_system + "\n\n" + AGENT_SYSTEM_PROMPT).strip() if persona_system else AGENT_SYSTEM_PROMPT
+    shell_enabled = parse_bool_config(config.get("agent_shell", True))
+    agent_prompt = AGENT_SYSTEM_PROMPT_WITH_SHELL if shell_enabled else AGENT_SYSTEM_PROMPT
+    system_content = (persona_system + "\n\n" + agent_prompt).strip() if persona_system else agent_prompt
 
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_content},
@@ -1839,13 +1862,10 @@ def cmd_agent(args: argparse.Namespace) -> int:
         if trace:
             print(f"--- Step {step}/{max_steps} ---")
 
-        resp_chunks: List[str] = []
-
         def on_tok(t: str) -> None:
             if trace:
                 sys.stdout.write(t)
                 sys.stdout.flush()
-            resp_chunks.append(t)
 
         try:
             resp_text, elapsed, tok_count = stream_chat_completion(
@@ -1910,11 +1930,17 @@ def cmd_agent(args: argparse.Namespace) -> int:
             elif tool_name == "calc":
                 tool_result = tool_calc(str(tool_args.get("expression", "")))
             elif tool_name == "shell":
-                tool_result = tool_shell(
-                    sandbox_root,
-                    str(tool_args.get("cmd", "")),
-                    yes=yes,
-                )
+                if not shell_enabled:
+                    tool_result = (
+                        "Error: shell tool is disabled by configuration. "
+                        "Enable it with: gx set agent_shell true"
+                    )
+                else:
+                    tool_result = tool_shell(
+                        sandbox_root,
+                        str(tool_args.get("cmd", "")),
+                        yes=yes,
+                    )
             else:
                 tool_result = f"Error: Unknown tool '{tool_name}'."
 
@@ -2151,7 +2177,10 @@ def cmd_set(args: argparse.Namespace) -> int:
     key = args.key.lower()
     value = args.value
 
-    valid_keys = {"temp", "ctx", "threads", "max_tokens", "system", "models_dir", "host", "port", "model"}
+    valid_keys = {
+        "temp", "ctx", "threads", "max_tokens", "system", "models_dir",
+        "host", "port", "model", "agent_shell",
+    }
     if key not in valid_keys:
         sys.stderr.write(f"Error: Unknown key '{key}'. Valid keys: {', '.join(sorted(valid_keys))}\n")
         return 1
@@ -2159,6 +2188,8 @@ def cmd_set(args: argparse.Namespace) -> int:
     try:
         if key == "temp":
             config[key] = float(value)
+        elif key == "agent_shell":
+            config[key] = parse_bool_config(value)
         elif key in ("ctx", "threads", "max_tokens", "port"):
             config[key] = int(value)
         else:
@@ -2277,6 +2308,30 @@ def cmd_server(args: argparse.Namespace) -> int:
             print(f"Model: {model_name}")
             print(f"URL:   http://{host}:{port}")
             print(f"Log:   {log_file}")
+
+            # Wait until the HTTP endpoint accepts requests (model load can take a while).
+            base_url = get_base_url(config)
+            print("Waiting for server", end="", flush=True)
+            ready = False
+            for _ in range(60):  # up to ~30s for large models to load
+                if proc.poll() is not None:
+                    print()
+                    sys.stderr.write(
+                        f"Error: llama-server exited during startup (exit code {proc.returncode}). Check the log: {log_file}\n"
+                    )
+                    return 1
+                try:
+                    with urllib.request.urlopen(f"{base_url}/v1/models", timeout=1.0):
+                        ready = True
+                        break
+                except Exception:
+                    print(".", end="", flush=True)
+                    time.sleep(0.5)
+            print()
+            if ready:
+                print(f"Server ready at {base_url}")
+            else:
+                print("Server still loading (large models can take a while). Check with: gx server status")
             return 0
         except Exception as e:
             sys.stderr.write(f"Error launching llama-server: {e}\n")
@@ -2402,7 +2457,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
                     messages, base_url, config, on_token=on_tok
                 )
                 tok_s = count / elapsed if elapsed > 0 else 0.0
-                print(f"\n[{count} tokens, {tok_per_sec:.1f} tok/s]" if 'tok_per_sec' in locals() else f"\n[{count} tokens, {tok_s:.1f} tok/s]")
+                print(f"\n[{count} tokens, {tok_s:.1f} tok/s]")
 
                 runs_completed += 1
                 total_tokens += count
@@ -2486,7 +2541,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f" [FAIL] Personas directory '{personas_dir}' does not exist")
         all_ok = False
 
-    # 4. Templates Directory and Built-ins
+    # 5. Templates Directory and Built-ins
     if os.path.isdir(templates_dir):
         t_files = os.listdir(templates_dir)
         builtins_ok = all(f"{b}.txt" in t_files for b in BUILTIN_TEMPLATES)
@@ -2499,7 +2554,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f" [FAIL] Templates directory '{templates_dir}' does not exist")
         all_ok = False
 
-    # 5. Models Directory & GGUF files
+    # 6. Models Directory & GGUF files
     if os.path.isdir(models_dir):
         ggufs = list_gguf_models(models_dir)
         if ggufs:
@@ -2513,7 +2568,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"        Fix: mkdir -p {models_dir} && place .gguf models there")
         all_ok = False
 
-    # 6. Free Disk Space
+    # 7. Free Disk Space
     try:
         check_path = models_dir if os.path.isdir(models_dir) else get_config_dir()
         usage = shutil.disk_usage(check_path)
@@ -2525,7 +2580,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
-    # 7. llama-server binary
+    # 8. llama-server binary
     llama_bin = find_llama_server_binary()
     if llama_bin:
         print(f" [OK]   llama-server found: {llama_bin}")
@@ -2534,7 +2589,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("        Fix: pkg install llama-cpp or build llama.cpp from source")
         all_ok = False
 
-    # 8. Server reachability
+    # 9. Server reachability
     try:
         req = urllib.request.Request(f"{base_url}/v1/models", headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=1.5):

@@ -1,18 +1,14 @@
-*.iml
-.gradle
-.kotlin
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
+# Python
+__pycache__/
+*.py[cod]
+
+# gx runtime state (default location is ~/.gx; ignored if GX_HOME points into the repo)
+.gx/
+*.pid
+*.log
+
+# Editors / OS
 .DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
-local.properties
-.env
-debug.keystore
+.idea/
+.vscode/
+*.swp

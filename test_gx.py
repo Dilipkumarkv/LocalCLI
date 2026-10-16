@@ -17,6 +17,21 @@ import gx
 MOCK_FILE_DATA = b"GGUF_MODEL_MOCK_DATA_0123456789" * 10  # 320 bytes
 
 
+def _can_create_symlinks() -> bool:
+    """Check whether the platform allows creating symlinks (Windows may require privileges)."""
+    if os.name != "nt":
+        return True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "target.txt")
+            with open(target, "w") as f:
+                f.write("x")
+            os.symlink(target, os.path.join(tmp, "link.txt"))
+        return True
+    except OSError:
+        return False
+
+
 class MockLlamaHandler(http.server.BaseHTTPRequestHandler):
     """Mock HTTP handler emulating llama-server OpenAI API and file downloads."""
 
@@ -708,7 +723,7 @@ class TestGxCLI(unittest.TestCase):
         self.assertEqual(obj5.get("tool"), "first_tool")
 
     def test_sandbox_path_validation_and_rejections(self) -> None:
-        """Test sandbox path resolution and rejection of .., absolute escapes, and escaping symlinks."""
+        """Test sandbox path resolution and rejection of .. and absolute escapes."""
         sandbox = os.path.join(self.test_dir, "agent_sandbox")
         os.makedirs(sandbox, exist_ok=True)
         inside_file = os.path.join(sandbox, "valid.txt")
@@ -730,7 +745,12 @@ class TestGxCLI(unittest.TestCase):
         self.assertIsNotNone(err_abs)
         self.assertIn("escapes sandbox", err_abs)
 
-        # 4. Escape via symlink pointing outside
+    @unittest.skipUnless(_can_create_symlinks(), "symlink creation requires privileges on this platform")
+    def test_sandbox_symlink_escape_rejected(self) -> None:
+        """Test that a symlink pointing outside the sandbox is rejected."""
+        sandbox = os.path.join(self.test_dir, "agent_sandbox_link")
+        os.makedirs(sandbox, exist_ok=True)
+
         outside_dir = tempfile.mkdtemp(prefix="outside_")
         outside_file = os.path.join(outside_dir, "secret.txt")
         with open(outside_file, "w") as f:
