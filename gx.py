@@ -374,8 +374,8 @@ def load_config() -> Dict[str, Any]:
                 loaded = json.load(f)
                 if isinstance(loaded, dict):
                     cfg.update(loaded)
-        except Exception:
-            pass
+        except Exception as e:
+            sys.stderr.write(f"Warning: Could not read {cfg_file} ({e}); using defaults.\n")
     return cfg
 
 
@@ -716,6 +716,20 @@ def normalize_model_url(url: str) -> str:
     if "huggingface.co" in url and "/blob/" in url:
         return url.replace("/blob/", "/resolve/")
     return url
+
+
+def _is_huggingface_url(url: str) -> bool:
+    """Return True if the URL points at a Hugging Face host (used for token scoping)."""
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        return False
+    return (
+        host == "huggingface.co"
+        or host == "hf.co"
+        or host.endswith(".huggingface.co")
+        or host.endswith(".hf.co")
+    )
 
 
 # Command Implementations
@@ -1329,8 +1343,15 @@ def cmd_bench(args: argparse.Namespace) -> int:
         if not os.path.isfile(history_file):
             print("No benchmark history found.")
             return 0
+        lines = []
         with open(history_file, "r", encoding="utf-8") as f:
-            lines = [json.loads(l) for l in f if l.strip()]
+            for l in f:
+                if not l.strip():
+                    continue
+                try:
+                    lines.append(json.loads(l))
+                except json.JSONDecodeError:
+                    sys.stderr.write("Warning: Skipping corrupted line in benchmark history.\n")
         if not lines:
             print("No benchmark history found.")
             return 0
@@ -1355,12 +1376,18 @@ def cmd_bench(args: argparse.Namespace) -> int:
     gen_tokens = args.gen_tokens if args.gen_tokens is not None else 64
 
     sweep_spec = getattr(args, "sweep", None)
-    if sweep_spec and "threads=" in sweep_spec:
+    if sweep_spec:
+        if "threads=" not in sweep_spec:
+            sys.stderr.write("Error: Invalid sweep format. Expected e.g. --sweep threads=2,4,6\n")
+            return 1
         threads_str = sweep_spec.split("threads=")[1]
         try:
             thread_list = [int(t.strip()) for t in threads_str.split(",") if t.strip()]
         except ValueError:
             sys.stderr.write("Error: Invalid sweep format. Expected e.g. --sweep threads=2,4,6\n")
+            return 1
+        if not thread_list:
+            sys.stderr.write("Error: No thread values found in sweep. Expected e.g. --sweep threads=2,4,6\n")
             return 1
 
         print(f"Starting threads sweep {thread_list} for model: {model_name}...")
@@ -1379,11 +1406,32 @@ def cmd_bench(args: argparse.Namespace) -> int:
                 res = run_benchmark_suite(runs, prompt_tokens, gen_tokens, base_url, config)
                 res["threads"] = th
                 results.append(res)
-        except ConnectionError as e:
+        except (ConnectionError, urllib.error.URLError) as e:
             sys.stderr.write(f"Error: benchmark failed during sweep: {e}\nSweep aborted.\n")
         finally:
             config["threads"] = orig_threads
             save_config(config)
+
+        # Record sweep results in the bench history (same format as single runs)
+        for r in results:
+            sweep_entry = {
+                "timestamp": time.time(),
+                "model": model_name,
+                "quant": quant,
+                "ctx": ctx,
+                "threads": r.get("threads", config.get("threads", 4)),
+                "avg_gen_tok_s": round(r["avg_gen_tok_s"], 2),
+                "min_gen_tok_s": round(r["min_gen_tok_s"], 2),
+                "max_gen_tok_s": round(r["max_gen_tok_s"], 2),
+                "avg_ttft_ms": round(r["avg_ttft_ms"], 2),
+                "avg_prompt_tok_s": round(r.get("avg_prompt_tok_s", 0.0), 2),
+                "sweep": True,
+            }
+            try:
+                with open(history_file, "a", encoding="utf-8") as hf:
+                    hf.write(json.dumps(sweep_entry) + "\n")
+            except Exception:
+                pass
 
         best_speed = max(r["avg_gen_tok_s"] for r in results) if results else 0.0
 
@@ -1453,6 +1501,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 # Agent System Prompt, Sandbox Tools & Execution Loop
+
+# Cap on tool-result text fed back into the agent's message history (context budget).
+MAX_AGENT_TOOL_RESULT_CHARS = 2000
 
 AGENT_SYSTEM_PROMPT = """You are an autonomous AI assistant that solves tasks by executing tools.
 All tool paths must be within the current sandbox directory.
@@ -1560,6 +1611,10 @@ def resolve_sandbox_path(sandbox_dir: str, user_path: str) -> Tuple[Optional[str
         target_path = os.path.abspath(os.path.join(sandbox_root, user_path))
 
     real_target = os.path.realpath(target_path)
+    if real_target == sandbox_root:
+        # The sandbox root itself is always valid; the parent check below would
+        # wrongly reject it because its parent directory lies outside the sandbox.
+        return real_target, None
     parent_dir = os.path.dirname(target_path)
     real_parent = os.path.realpath(parent_dir)
 
@@ -1667,8 +1722,21 @@ def tool_write_file(
         return f"Error writing file '{path}': {e}"
 
 
+def _is_within_root(root: str, candidate: str) -> bool:
+    """Return True if candidate resolves (after symlink expansion) to a path inside root."""
+    try:
+        real_candidate = os.path.realpath(candidate)
+        return os.path.commonpath([root, real_candidate]) == root
+    except (ValueError, OSError):
+        return False
+
+
 def tool_search_files(sandbox_dir: str, pattern: str, path: str = ".") -> str:
-    """Search for plain-text pattern across files in sandbox (max 20 matches)."""
+    """Search for plain-text pattern across files in sandbox (max 20 matches).
+
+    Every file is re-validated after symlink resolution so that links pointing
+    outside the sandbox are skipped (mirrors resolve_sandbox_path's guarantee).
+    """
     real_path, err = resolve_sandbox_path(sandbox_dir, path)
     if err:
         return err
@@ -1676,34 +1744,49 @@ def tool_search_files(sandbox_dir: str, pattern: str, path: str = ".") -> str:
     if not os.path.exists(real_path):
         return f"Error: Path '{path}' not found."
 
+    if not pattern:
+        return "Error: Empty search pattern."
+
+    sandbox_root = os.path.realpath(os.path.abspath(sandbox_dir))
     matches: List[str] = []
     max_matches = 20
     reached_limit = False
+    skipped_unsafe = 0
 
-    sandbox_root = os.path.realpath(os.path.abspath(sandbox_dir))
+    if os.path.isfile(real_path):
+        candidates: List[str] = [real_path]
+    else:
+        candidates = []
+        for root, _, files in os.walk(real_path):
+            for f in sorted(files):
+                candidates.append(os.path.join(root, f))
 
-    for root, _, files in os.walk(real_path):
+    for file_path in candidates:
         if reached_limit:
             break
-        for f in sorted(files):
-            file_path = os.path.join(root, f)
-            rel_path = os.path.relpath(file_path, sandbox_root)
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as file_obj:
-                    for line_idx, line in enumerate(file_obj, 1):
-                        if pattern in line:
-                            matches.append(f"{rel_path}:{line_idx}: {line.strip()[:150]}")
-                            if len(matches) >= max_matches:
-                                reached_limit = True
-                                break
-            except Exception:
-                continue
+        if not _is_within_root(sandbox_root, file_path):
+            skipped_unsafe += 1
+            continue
+        rel_path = os.path.relpath(os.path.realpath(file_path), sandbox_root)
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as file_obj:
+                for line_idx, line in enumerate(file_obj, 1):
+                    if pattern in line:
+                        matches.append(f"{rel_path}:{line_idx}: {line.strip()[:150]}")
+                        if len(matches) >= max_matches:
+                            reached_limit = True
+                            break
+        except Exception:
+            continue
 
     if not matches:
-        return "No matches found."
-    out = "\n".join(matches)
-    if reached_limit:
-        out += "\n[Reached limit of 20 matches]"
+        out = "No matches found."
+    else:
+        out = "\n".join(matches)
+        if reached_limit:
+            out += "\n[Reached limit of 20 matches]"
+    if skipped_unsafe:
+        out += f"\n[Skipped {skipped_unsafe} path(s) resolving outside the sandbox]"
     return out
 
 
@@ -1728,8 +1811,6 @@ def _safe_eval_ast_node(node: ast.AST) -> Any:
         if isinstance(node.value, (int, float)):
             return node.value
         raise ValueError(f"Disallowed constant type: {type(node.value).__name__}")
-    elif isinstance(node, ast.Num):  # Python < 3.8 compatibility
-        return getattr(node, "n")
     elif isinstance(node, ast.BinOp):
         left = _safe_eval_ast_node(node.left)
         right = _safe_eval_ast_node(node.right)
@@ -1862,6 +1943,11 @@ def cmd_agent(args: argparse.Namespace) -> int:
         if trace:
             print(f"--- Step {step}/{max_steps} ---")
 
+        ctx_limit = int(config.get("ctx", 2048))
+        messages, dropped = apply_context_guard(messages, ctx_limit, threshold_pct=0.8)
+        if dropped > 0 and trace:
+            print(f"[Context guard: trimmed {dropped} older message(s) to stay within 80% of {ctx_limit} tokens]")
+
         def on_tok(t: str) -> None:
             if trace:
                 sys.stdout.write(t)
@@ -1948,7 +2034,12 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 print(f"Tool [{tool_name}] output:\n{tool_result}\n")
 
             messages.append({"role": "assistant", "content": json.dumps(json_obj)})
-            messages.append({"role": "user", "content": f"Tool '{tool_name}' result:\n{tool_result}"})
+            injected_result = (
+                tool_result
+                if len(tool_result) <= MAX_AGENT_TOOL_RESULT_CHARS
+                else tool_result[:MAX_AGENT_TOOL_RESULT_CHARS] + "\n[Truncated for context budget]"
+            )
+            messages.append({"role": "user", "content": f"Tool '{tool_name}' result:\n{injected_result}"})
             continue
 
         # If JSON dict has neither 'final' nor 'tool'
@@ -1982,6 +2073,18 @@ def cmd_agent(args: argparse.Namespace) -> int:
     return 0 if outcome == "final" else (1 if outcome == "aborted" else 0)
 
 
+def remote_content_length(url: str, headers: Optional[Dict[str, str]] = None) -> Optional[int]:
+    """Fetch the remote file size via a HEAD request; returns None on any failure."""
+    head_headers = {k: v for k, v in (headers or {}).items() if k.lower() != "range"}
+    try:
+        req = urllib.request.Request(url, headers=head_headers, method="HEAD")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            content_len = resp.headers.get("Content-Length")
+            return int(content_len) if content_len else None
+    except Exception:
+        return None
+
+
 def cmd_pull(args: argparse.Namespace) -> int:
     """Download a GGUF model into models directory with resume support and progress tracking."""
     config = load_config()
@@ -1998,6 +2101,10 @@ def cmd_pull(args: argparse.Namespace) -> int:
         filename = os.path.basename(parsed.path)
         if not filename or filename == "/":
             filename = "model.gguf"
+
+    if not filename or os.path.basename(filename) != filename or filename in (".", ".."):
+        sys.stderr.write(f"Error: Invalid output filename '{filename}' (path separators are not allowed).\n")
+        return 1
 
     target_file = os.path.join(models_dir, filename)
     part_file = target_file + ".part"
@@ -2018,7 +2125,8 @@ def cmd_pull(args: argparse.Namespace) -> int:
 
     headers = {"User-Agent": "gx-downloader/1.0"}
     hf_token = os.environ.get("HF_TOKEN")
-    if hf_token:
+    if hf_token and _is_huggingface_url(url):
+        # Only send the token to Hugging Face hosts so it cannot leak to arbitrary servers.
         headers["Authorization"] = f"Bearer {hf_token}"
 
     existing_size = 0
@@ -2033,11 +2141,24 @@ def cmd_pull(args: argparse.Namespace) -> int:
     try:
         response = urllib.request.urlopen(req, timeout=30)
     except urllib.error.HTTPError as e:
-        if e.code == 416:
-            if existing_size > 0:
+        if e.code == 416 and existing_size > 0:
+            # The server says the requested Range is beyond EOF. Verify the local
+            # .part actually matches the remote file before finalizing; discard if stale.
+            expected_len = remote_content_length(url, headers)
+            if expected_len is not None and expected_len == existing_size:
                 shutil.move(part_file, target_file)
                 print(f"Download complete: {filename} ({format_file_size(existing_size)})")
                 return 0
+            try:
+                os.remove(part_file)
+            except OSError:
+                pass
+            expected_str = f"{expected_len} bytes" if expected_len is not None else "unknown size"
+            sys.stderr.write(
+                f"Error: Saved partial file ({existing_size} bytes) does not match the remote file"
+                f" ({expected_str}); partial data discarded. Re-run the command to restart.\n"
+            )
+            return 1
         sys.stderr.write(f"HTTP Error {e.code}: {e.reason}\n")
         return 1
     except Exception as e:
@@ -2235,7 +2356,9 @@ def cmd_server(args: argparse.Namespace) -> int:
                 if not is_pid_alive(pid):
                     break
             if is_pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
+                # SIGKILL is POSIX-only; on Windows os.kill(SIGTERM) already
+                # terminates unconditionally, so fall back to it there.
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             print(f"Stopped llama-server (PID: {pid}).")
         except Exception as e:
             sys.stderr.write(f"Error stopping process {pid}: {e}\n")
@@ -2316,6 +2439,10 @@ def cmd_server(args: argparse.Namespace) -> int:
             for _ in range(60):  # up to ~30s for large models to load
                 if proc.poll() is not None:
                     print()
+                    try:
+                        os.remove(get_pid_file())
+                    except OSError:
+                        pass
                     sys.stderr.write(
                         f"Error: llama-server exited during startup (exit code {proc.returncode}). Check the log: {log_file}\n"
                     )
@@ -2388,6 +2515,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
     runs_completed = 0
 
     print(f"Starting gx loop (Target: {base_url})")
+    loop_error = False
 
     try:
         if until_target:
@@ -2477,6 +2605,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
         print("\n\n[Loop interrupted by user]")
     except Exception as e:
         sys.stderr.write(f"\nError in loop: {e}\n")
+        loop_error = True
 
     avg_speed = total_tokens / total_time if total_time > 0 else 0.0
     print("\n--- Summary ---")
@@ -2486,7 +2615,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
     if out_file:
         print(f"Results saved:  {out_file}")
 
-    return 0
+    return 1 if (loop_error and runs_completed == 0) else 0
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -2505,10 +2634,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # 1. Python Version
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    if sys.version_info >= (3, 8):
+    if sys.version_info >= (3, 9):
         print(f" [OK]   Python version: {py_ver}")
     else:
-        print(f" [FAIL] Python version: {py_ver} (< 3.8)")
+        print(f" [FAIL] Python version: {py_ver} (< 3.9)")
         print("        Fix: pkg install python")
         all_ok = False
 

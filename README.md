@@ -16,9 +16,9 @@ $ gx ask "explain quantization in one paragraph"
 
 - **Streaming chat** — `ask` (one-shot), `chat` (interactive REPL with `/exit`, `/clear`, `/sys`)
 - **Sessions** — auto-save/resume conversations (`--save`, `--load`), list/show/delete/export to Markdown
-- **Personas** — switch system prompt + sampling params + pinned model (`coder`, `tutor`, `terse` built in)
+- **Personas** — switch system prompt + sampling params (`coder`, `tutor`, `terse` built in); pinning a model is a custom-persona feature — the built-ins pin no model
 - **Prompt templates** — `{{variable}}` templates, render with `gx run tpl_name key=value ...`
-- **Agent mode** — autonomous tool loop (read/write/list/search files, calc) with a **validated sandbox** and human confirmation for dangerous tools
+- **Agent mode** — autonomous tool loop (read/write/list/search files, calc) with a **validated sandbox** and human confirmation for dangerous tools; the loop runs a context guard that trims the oldest messages beyond 80% of `ctx` and caps tool results fed back into the conversation at 2000 characters
 - **Benchmarks** — TTFT + tok/s, thread sweeps, thermal-throttle detection, JSONL history
 - **Model manager** — list/select GGUF files with fuzzy matching; `pull` downloads with resume (HTTP Range), Hugging Face blob-URL auto-fix, disk-space checks
 - **Server lifecycle** — `gx server start|stop|status` with readiness polling and log capture
@@ -27,7 +27,7 @@ $ gx ask "explain quantization in one paragraph"
 
 ## Requirements
 
-- Python **3.8+** (`pkg install python`)
+- Python **3.9+** (`pkg install python`)
 - `llama-server` binary (`pkg install llama-cpp`, or build llama.cpp)
 - One or more `.gguf` model files
 
@@ -54,22 +54,24 @@ gx keeps its state in `~/.gx/` (config, sessions, personas, templates, logs). Se
 | Command | Purpose |
 |---|---|
 | `gx ask "..." [--persona p]` | One-shot prompt with streaming output; stdin is merged (`cat file \| gx ask "summarize"`) |
-| `gx chat [--save name] [--load name]` | Interactive chat with context guard and auto-save |
-| `gx session list\|show\|rm\|export <name>` | Manage saved sessions |
+| `gx chat [--save name] [--load name] [--persona p]` | Interactive chat with context guard and auto-save |
+| `gx session list\|show\|rm\|export <name>` | Manage saved sessions (`rm` accepts `-y` to skip confirmation) |
 | `gx persona list\|show\|add\|edit\|rm` | Manage personas |
 | `gx tpl list\|show\|add\|rm` | Manage prompt templates |
-| `gx run <template> key=value ...` | Render + send a template |
-| `gx agent "task" [--trace] [--max-steps N] [--dir sandbox] [-y] [--save name]` | Autonomous tool-using agent |
-| `gx bench [--runs N] [--sweep threads=2,4,6] [--history]` | Benchmark TTFT / generation speed |
-| `gx pull <url> [--force] [--out name]` | Download GGUF with resume support (`HF_TOKEN` honored) |
+| `gx run <template> key=value ... [--persona p]` | Render + send a template |
+| `gx agent "task" [--trace] [--max-steps N] [--dir sandbox] [-y] [--save name] [--persona p]` | Autonomous tool-using agent |
+| `gx bench [--runs N] [--prompt-tokens N] [--gen-tokens N] [--out file] [--sweep threads=2,4,6] [--history]` | Benchmark TTFT / generation speed (`--sweep` requires the `threads=` prefix — a clear error is printed otherwise — and sweep results are also recorded in bench history) |
+| `gx pull <url> [--force] [--out name]` | Download GGUF with resume support (`HF_TOKEN` honored); `--out` rejects path separators, and when a resume hits HTTP 416 the local `.part` size is verified against the remote file via HEAD before finalizing — stale partial data is discarded and a re-run restarts the download |
 | `gx model list\|use <name>` | List / select models from `~/models` |
 | `gx set <key> <value>` | Update config (see below) |
 | `gx server start\|stop\|status` | Manage the llama-server process |
-| `gx loop "prompt" [-n 5 \| -f file \| --until text]` | Repetitive / batch runs |
+| `gx loop "prompt" [-n 5 \| -f file \| --until text] [--max-iter N] [--out file] [--persona p]` | Repetitive / batch runs |
 | `gx doctor` | Diagnose the environment |
 | `gx selftest` | Run the built-in test suite (no server needed) |
 
 Piping with no subcommand also works: `echo "hi" | gx` sends "hi" as a prompt.
+
+Root-level overrides `--host`, `--port`, and `--url` re-target the llama-server endpoint for any command and must precede the subcommand, e.g. `gx --url http://192.168.1.4:8081 ask "hi"`.
 
 ## Configuration
 
@@ -91,27 +93,29 @@ Environment overrides: `GX_HOME` (state dir), `GX_URL` (full base URL), `GX_HOST
 
 ## Security notes for `gx agent`
 
-- The **file tools** (`read_file`, `write_file`, `list_dir`, `search_files`) are strictly confined to the sandbox directory (`--dir`, default `.`). Path traversal (`..`), absolute escapes, and symlink escapes are rejected.
+- All four **file tools** (`read_file`, `write_file`, `list_dir`, `search_files`) are strictly confined to the sandbox directory (`--dir`, default `.`): every path is re-validated after symlink resolution. Path traversal (`..`), absolute escapes, and symlink escapes are rejected; `search_files` additionally skips (and reports) any file or link resolving outside the sandbox.
+- `write_file` asks for interactive confirmation on **every** write — including new files, not just overwrites — **unless you pass `-y`/`--yes`**.
 - `calc` is a sandboxed AST arithmetic evaluator — no `eval()`, no attribute access.
 - ⚠️ The **`shell` tool is NOT filesystem-confined**: it runs a real shell with the sandbox as working directory, so a model can reach anything your user account can. Mitigations:
-  - every `shell` (and overwrite `write_file`) call asks for interactive confirmation **unless you pass `-y`/`--yes`**;
+  - every `shell` call asks for interactive confirmation **unless you pass `-y`/`--yes`**;
   - it can be disabled entirely: `gx set agent_shell false` (the tool then reports it is disabled and the agent falls back to file tools);
   - avoid `--yes` with untrusted prompts — small local models are easy to prompt-inject.
+- `HF_TOKEN` is only ever sent to `huggingface.co` / `hf.co` hosts (including subdomains) — never to other download URLs.
 - Agent runs are appended to `~/.gx/agent_log.jsonl` (task, steps, tools used, outcome) for auditing.
 
 ## Testing & CI
 
-The suite runs against a fully mocked llama-server (SSE streaming, HTTP Range downloads, scripted agent conversations) — no model or network needed:
+The full suite runs against a fully mocked llama-server (SSE streaming, HTTP Range downloads, scripted agent conversations) — no model or network needed:
 
 ```bash
 python gx.py selftest      # or: python -m unittest test_gx -v
 ```
 
-CI runs it on Ubuntu across Python 3.9–3.13 on every push/PR.
+CI runs on pushes to `main` and on all pull requests. On Ubuntu, it runs a `py_compile` syntax check and then the full suite (`python gx.py selftest`) across Python 3.9–3.13.
 
 ## Limitations
 
-- Token counts use a ~4-chars-per-token heuristic (offline-friendly); the context guard is therefore approximate.
+- Token counts use a ~4-chars-per-token heuristic (offline-friendly); the context guards in `chat` and the `agent` loop are therefore approximate.
 - Designed primarily for Termux/Linux; on Windows the sandbox symlink-escape test is skipped unless symlink privileges are enabled.
 - `server` management expects the `llama-server` OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`).
 
